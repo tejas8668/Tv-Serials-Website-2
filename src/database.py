@@ -4,71 +4,88 @@ import os
 from datetime import datetime, timedelta
 import logging
 import time
+import threading
 
 logger = logging.getLogger(__name__)
 
 class Database:
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(Database, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        self._init_connection()
-        
+        if self._initialized:
+            return
+            
+        self._initialized = True
+        self.client = None
+        self.db = None
+        self.collection = None
+        self._latest_number = None
+        self._cache_time = None
+        self._cache_duration = timedelta(minutes=5)
+
+    def _ensure_connection(self):
+        """Ensure MongoDB connection exists and is alive"""
+        if self.client is None:
+            self._init_connection()
+        else:
+            try:
+                # Ping to check connection
+                self.client.admin.command('ping')
+            except Exception:
+                logger.warning("MongoDB connection lost, reconnecting...")
+                self._init_connection()
+    
     def _init_connection(self):
-        # Connection pool settings
-        self.client = MongoClient(
-            os.getenv("MONGO_URI"),
-            maxPoolSize=10,  # Reduced pool size for better stability
-            minPoolSize=5,
-            maxIdleTimeMS=45000,
-            connectTimeoutMS=5000,  # Increased timeout
-            serverSelectionTimeoutMS=5000,
-            retryWrites=True,
-            retryReads=True,
-            w='majority',  # Ensure writes are acknowledged
-            socketTimeoutMS=10000,  # Added socket timeout
-        )
-        
-        # Verify connection with retries
+        """Initialize MongoDB connection with retries"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                # Connection pool settings
+                self.client = MongoClient(
+                    os.getenv("MONGO_URI"),
+                    maxPoolSize=10,
+                    minPoolSize=1,
+                    maxIdleTimeMS=45000,
+                    connectTimeoutMS=5000,
+                    serverSelectionTimeoutMS=5000,
+                    retryWrites=True,
+                    retryReads=True,
+                    w='majority',
+                    socketTimeoutMS=10000,
+                    connect=False  # Defer actual connection
+                )
+                
+                # Test connection
                 self.client.admin.command('ping')
                 logger.info("Successfully connected to MongoDB")
+                
+                self.db = self.client["telegram_bot_db"]
+                self.collection = self.db["files"]
+                
+                # Ensure index exists
+                self.collection.create_index([("file_number", DESCENDING)])
                 break
+                
             except ConnectionFailure as e:
                 if attempt == max_retries - 1:
                     logger.error(f"Could not connect to MongoDB after {max_retries} attempts: {str(e)}")
                     raise
                 logger.warning(f"Connection attempt {attempt + 1} failed, retrying...")
                 time.sleep(1)
-            
-        self.db = self.client["telegram_bot_db"]
-        self.collection = self.db["files"]
-        
-        # List all collections
-        collections = self.db.list_collection_names()
-        logger.info(f"Available collections: {collections}")
-        
-        # Ensure index exists
-        self.collection.create_index([("file_number", DESCENDING)])
-        
-        # Cache variables
-        self._latest_number = None
-        self._cache_time = None
-        self._cache_duration = timedelta(minutes=5)
-
-    def _get_total_count(self):
-        """Get total count with caching"""
-        current_time = datetime.now()
-        
-        if self._cache_time and current_time - self._cache_time < self._cache_duration:
-            return self._latest_number
-            
-        # Update cache using fast count with hint
-        count = self.collection.count_documents({}, hint="file_number_-1")
-        self._latest_number = count
-        self._cache_time = current_time
-        return count
 
     def fetch_files(self, page, posts_per_page):
+        """Fetch files with pagination"""
+        self._ensure_connection()
+        
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -114,3 +131,17 @@ class Database:
             except Exception as e:
                 logger.error(f"Unexpected error fetching files: {str(e)}")
                 raise
+
+    def _get_total_count(self):
+        """Get total count with caching"""
+        self._ensure_connection()
+        
+        current_time = datetime.now()
+        if self._cache_time and current_time - self._cache_time < self._cache_duration:
+            return self._latest_number
+            
+        # Update cache using fast count with hint
+        count = self.collection.count_documents({}, hint="file_number_-1")
+        self._latest_number = count
+        self._cache_time = current_time
+        return count
