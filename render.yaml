@@ -3,7 +3,7 @@ services:
     name: daily-tv-serials
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn wsgi:app
+    startCommand: gunicorn -c gunicorn.conf.py wsgi:app
     envVars:
       - key: MONGO_URI
         sync: false
