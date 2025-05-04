@@ -5,11 +5,9 @@ from dotenv import load_dotenv
 from functools import wraps
 from time import time
 import logging
-from pymongo.errors import ConnectionFailure
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-# Suppress MongoDB OCSP debug logs
 logging.getLogger('pymongo.ocsp_support').setLevel(logging.WARNING)
 logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 
@@ -27,30 +25,23 @@ if os.environ.get('RENDER'):
 # Configure static files cache
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 31536000  # 1 year in seconds
 
-# Initialize database with retry
-def init_database():
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            return Database()
-        except ConnectionFailure as e:
-            if attempt == max_retries - 1:
-                logger.error(f"Failed to initialize database after {max_retries} attempts")
-                raise
-            logger.warning(f"Database initialization attempt {attempt + 1} failed, retrying...")
-            time.sleep(2 ** attempt)  # Exponential backoff
-
-try:
-    db = init_database()
-except Exception as e:
-    logger.error(f"Could not initialize database: {str(e)}")
-    db = None
+# Database will be initialized lazily by each worker
+db = None
 
 POSTS_PER_PAGE = 40
 
+def get_db():
+    global db
+    if db is None:
+        db = Database()
+    return db
+
 @app.before_request
 def check_database():
-    if not db:
+    try:
+        get_db()
+    except Exception as e:
+        logger.error(f"Database connection error: {str(e)}")
         return jsonify({"error": "Database connection not available"}), 503
 
 @app.after_request
@@ -76,20 +67,12 @@ def timing_decorator(f):
         start = time()
         result = f(*args, **kwargs)
         end = time()
-        current_app.logger.info(f'{f.__name__} took {end - start:.2f} seconds')
+        logger.info(f'{f.__name__} took {end - start:.2f} seconds')
         return result
     return wrapper
 
 @app.route('/')
 def index():
-    # Try a test query
-    try:
-        sample = db.collection.find_one()
-        logger.info(f"Test query result: {sample}")
-        if not sample:
-            logger.error("No documents found in collection")
-    except Exception as e:
-        logger.error(f"Error during test query: {str(e)}")
     return render_template('index.html')
 
 @app.route('/files')
@@ -102,8 +85,7 @@ def get_files():
         if page < 1:
             return jsonify({"error": "Page number must be positive"}), 400
             
-        result = db.fetch_files(page, POSTS_PER_PAGE)
-        logger.debug(f'Database returned: {result}')
+        result = get_db().fetch_files(page, POSTS_PER_PAGE)
         
         if not result['data']:
             logger.warning('No data found in database')
@@ -119,13 +101,4 @@ def get_files():
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
-    # Test database connection on startup
-    try:
-        test_result = db.collection.find_one()
-        logger.info(f'Database test document: {test_result}')
-        if test_result:
-            logger.info(f'Available fields: {list(test_result.keys())}')
-    except Exception as e:
-        logger.error(f'Database connection failed: {str(e)}', exc_info=True)
-    
     app.run(debug=True)
