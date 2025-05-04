@@ -1,5 +1,5 @@
-from flask import Flask, render_template, jsonify, request, current_app
-from database import Database
+from flask import Flask, render_template, jsonify, request, current_app, send_from_directory
+from .database import Database
 import os
 from dotenv import load_dotenv
 from functools import wraps
@@ -23,9 +23,29 @@ app = Flask(__name__)
 if os.environ.get('RENDER'):
     app.config['PREFERRED_URL_SCHEME'] = 'https'
 
+# Configure static files cache
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 31536000  # 1 year in seconds
+
 db = Database()
 
 POSTS_PER_PAGE = 40
+
+@app.after_request
+def add_cache_headers(response):
+    # Cache static files
+    if request.path.startswith('/static/'):
+        response.cache_control.public = True
+        response.cache_control.max_age = 31536000  # 1 year
+        response.headers['Vary'] = 'Accept-Encoding'
+    return response
+
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory(
+        os.path.join(app.root_path, 'static'),
+        'favicon.png',
+        mimetype='image/png'
+    )
 
 def timing_decorator(f):
     @wraps(f)

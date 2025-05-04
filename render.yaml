@@ -3,9 +3,9 @@ services:
     name: daily-tv-serials
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn src.app:app
+    startCommand: gunicorn wsgi:app
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.0
       - key: MONGO_URI
         sync: false
+      - key: PYTHONPATH
+        value: .
