@@ -23,7 +23,6 @@ max_requests = 100
 max_requests_jitter = 10
 
 # Prevent zombie processes
-child_exit = True
 daemon = False
 
 def post_fork(server, worker):
