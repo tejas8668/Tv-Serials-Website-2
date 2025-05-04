@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from functools import wraps
 from time import time
 import logging
+from pymongo.errors import ConnectionFailure
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,9 +27,31 @@ if os.environ.get('RENDER'):
 # Configure static files cache
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 31536000  # 1 year in seconds
 
-db = Database()
+# Initialize database with retry
+def init_database():
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return Database()
+        except ConnectionFailure as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to initialize database after {max_retries} attempts")
+                raise
+            logger.warning(f"Database initialization attempt {attempt + 1} failed, retrying...")
+            time.sleep(2 ** attempt)  # Exponential backoff
+
+try:
+    db = init_database()
+except Exception as e:
+    logger.error(f"Could not initialize database: {str(e)}")
+    db = None
 
 POSTS_PER_PAGE = 40
+
+@app.before_request
+def check_database():
+    if not db:
+        return jsonify({"error": "Database connection not available"}), 503
 
 @app.after_request
 def add_cache_headers(response):
