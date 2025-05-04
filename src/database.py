@@ -23,7 +23,7 @@ class Database:
     def __init__(self):
         if self._initialized:
             return
-            
+        
         self._initialized = True
         self.client = None
         self.db = None
@@ -31,27 +31,43 @@ class Database:
         self._latest_number = None
         self._cache_time = None
         self._cache_duration = timedelta(minutes=5)
+        
+        # Initialize connection immediately
+        self._init_connection()
 
     def _ensure_connection(self):
         """Ensure MongoDB connection exists and is alive"""
-        if self.client is None:
-            self._init_connection()
-        else:
-            try:
-                # Ping to check connection
-                self.client.admin.command('ping')
-            except Exception:
-                logger.warning("MongoDB connection lost, reconnecting...")
+        try:
+            if self.client is None or self.collection is None:
                 self._init_connection()
-    
+                return
+            
+            # Test connection
+            self.client.admin.command('ping')
+        except Exception as e:
+            logger.warning(f"MongoDB connection check failed: {str(e)}, reconnecting...")
+            self._init_connection()
+
     def _init_connection(self):
         """Initialize MongoDB connection with retries"""
         max_retries = 3
+        last_error = None
+        
         for attempt in range(max_retries):
             try:
+                if self.client:
+                    try:
+                        self.client.close()
+                    except:
+                        pass
+                
+                mongo_uri = os.getenv("MONGO_URI")
+                if not mongo_uri:
+                    raise ValueError("MONGO_URI environment variable is not set")
+                
                 # Connection pool settings
                 self.client = MongoClient(
-                    os.getenv("MONGO_URI"),
+                    mongo_uri,
                     maxPoolSize=10,
                     minPoolSize=1,
                     maxIdleTimeMS=45000,
@@ -66,27 +82,38 @@ class Database:
                 
                 # Test connection
                 self.client.admin.command('ping')
-                logger.info("Successfully connected to MongoDB")
                 
-                self.db = self.client["telegram_bot_db"]
-                self.collection = self.db["files"]
+                # Initialize database and collection
+                self.db = self.client.get_database("telegram_bot_db")
+                self.collection = self.db.get_collection("files")
+                
+                # Verify collection exists and is accessible
+                self.collection.find_one()
                 
                 # Ensure index exists
                 self.collection.create_index([("file_number", DESCENDING)])
-                break
                 
-            except ConnectionFailure as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Could not connect to MongoDB after {max_retries} attempts: {str(e)}")
-                    raise
-                logger.warning(f"Connection attempt {attempt + 1} failed, retrying...")
-                time.sleep(1)
+                logger.info("Successfully connected to MongoDB and initialized collection")
+                return
+                
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    logger.warning(f"Connection attempt {attempt + 1} failed: {last_error}, retrying...")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+        
+        # If we get here, all retries failed
+        logger.error(f"Could not connect to MongoDB after {max_retries} attempts. Last error: {last_error}")
+        raise ConnectionFailure(f"Failed to establish MongoDB connection: {last_error}")
 
     def fetch_files(self, page, posts_per_page):
         """Fetch files with pagination"""
         self._ensure_connection()
         
         max_retries = 3
+        last_error = None
+        
         for attempt in range(max_retries):
             try:
                 total_items = self._get_total_count()
@@ -122,14 +149,15 @@ class Database:
                     "current_page": page
                 }
                 
-            except AutoReconnect as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to fetch files after {max_retries} attempts: {str(e)}")
-                    raise
-                logger.warning(f"Query attempt {attempt + 1} failed, retrying...")
-                time.sleep(1)
             except Exception as e:
-                logger.error(f"Unexpected error fetching files: {str(e)}")
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    logger.warning(f"Query attempt {attempt + 1} failed: {last_error}, retrying...")
+                    self._ensure_connection()  # Ensure connection is alive before retry
+                    time.sleep(1)
+                    continue
+                
+                logger.error(f"Failed to fetch files after {max_retries} attempts: {last_error}")
                 raise
 
     def _get_total_count(self):
@@ -139,9 +167,16 @@ class Database:
         current_time = datetime.now()
         if self._cache_time and current_time - self._cache_time < self._cache_duration:
             return self._latest_number
-            
-        # Update cache using fast count with hint
-        count = self.collection.count_documents({}, hint="file_number_-1")
-        self._latest_number = count
-        self._cache_time = current_time
-        return count
+        
+        try:
+            # Update cache using fast count with hint
+            count = self.collection.count_documents({})
+            self._latest_number = count
+            self._cache_time = current_time
+            return count
+        except Exception as e:
+            logger.error(f"Error getting total count: {str(e)}")
+            # Return cached value if available, otherwise raise
+            if self._latest_number is not None:
+                return self._latest_number
+            raise
